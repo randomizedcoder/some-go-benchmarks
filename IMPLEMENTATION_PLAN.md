@@ -1085,7 +1085,15 @@ func BenchmarkCancel_Atomic_Done_Parallel(b *testing.B) {
 }
 ```
 
-### 4.2 `internal/queue/queue_bench_test.go`
+### 4.2 Queue Benchmarks: Goroutine Topology
+
+Queue performance varies dramatically based on how goroutines interact. We benchmark three scenarios:
+
+#### 4.2.1 Single Goroutine (Baseline)
+
+Push+pop in the same goroutine—no lock contention:
+
+**File:** `internal/queue/queue_bench_test.go`
 
 ```go
 package queue_test
@@ -1099,6 +1107,7 @@ import (
 var sinkInt int
 var sinkOK bool
 
+// Single goroutine: push+pop in same routine (no contention)
 func BenchmarkQueue_Channel_PushPop_Direct(b *testing.B) {
     q := queue.NewChannel[int](1024)
     b.ReportAllocs()
@@ -1128,37 +1137,249 @@ func BenchmarkQueue_RingBuffer_PushPop_Direct(b *testing.B) {
     sinkInt = val
     sinkOK = ok
 }
+```
 
-func BenchmarkQueue_Channel_PushPop_Interface(b *testing.B) {
-    var q queue.Queue[int] = queue.NewChannel[int](1024)
+**Expected results:**
+
+| Implementation | Latency | Notes |
+|----------------|---------|-------|
+| Channel | ~39 ns | Go channel with no contention |
+| RingBuffer (guarded) | ~36 ns | SPSC guards add overhead |
+| RingBuffer (unguarded) | ~9.5 ns | True lock-free performance |
+
+#### 4.2.2 SPSC: 1 Producer → 1 Consumer (2 Goroutines)
+
+The classic producer/consumer pattern—one goroutine writes, another reads:
+
+**File:** `internal/combined/combined_bench_test.go`
+
+```go
+// BenchmarkPipeline_Channel benchmarks 2-goroutine SPSC with channels.
+func BenchmarkPipeline_Channel(b *testing.B) {
+    q := queue.NewChannel[int](1024)
+    done := make(chan struct{})
+
+    // Consumer goroutine
+    go func() {
+        for {
+            select {
+            case <-done:
+                return
+            default:
+                q.Pop()
+            }
+        }
+    }()
+
     b.ReportAllocs()
     b.ResetTimer()
 
-    var val int
-    var ok bool
+    // Producer (benchmark loop)
     for i := 0; i < b.N; i++ {
-        q.Push(i)
-        val, ok = q.Pop()
+        for !q.Push(i) {
+            // Spin until push succeeds
+        }
     }
-    sinkInt = val
-    sinkOK = ok
+
+    b.StopTimer()
+    close(done)
 }
 
-func BenchmarkQueue_RingBuffer_PushPop_Interface(b *testing.B) {
-    var q queue.Queue[int] = queue.NewRingBuffer[int](1024)
+// BenchmarkPipeline_RingBuffer benchmarks 2-goroutine SPSC with ring buffer.
+func BenchmarkPipeline_RingBuffer(b *testing.B) {
+    q := queue.NewRingBuffer[int](1024)
+    done := make(chan struct{})
+
+    // Consumer goroutine (single consumer - SPSC contract)
+    go func() {
+        for {
+            select {
+            case <-done:
+                return
+            default:
+                q.Pop()
+            }
+        }
+    }()
+
     b.ReportAllocs()
     b.ResetTimer()
 
-    var val int
-    var ok bool
+    // Producer (single producer - SPSC contract)
     for i := 0; i < b.N; i++ {
-        q.Push(i)
-        val, ok = q.Pop()
+        for !q.Push(i) {}
     }
-    sinkInt = val
-    sinkOK = ok
+
+    b.StopTimer()
+    close(done)
 }
 ```
+
+**Expected results:**
+
+| Implementation | Latency | Speedup |
+|----------------|---------|---------|
+| Channel | ~128 ns | baseline |
+| RingBuffer (guarded) | ~147 ns | 0.9x (slower due to guards!) |
+| RingBuffer (unguarded) | ~39 ns | **3.3x** |
+
+#### 4.2.3 MPSC: N Producers → 1 Consumer (Channels Only)
+
+Multiple producers sending to one consumer—a very common Go pattern:
+
+```go
+// BenchmarkMPSC_Channel_2Producers benchmarks 2 producers -> 1 consumer.
+func BenchmarkMPSC_Channel_2Producers(b *testing.B) {
+    ch := make(chan int, 1024)
+    done := make(chan struct{})
+    consumerDone := make(chan struct{})
+
+    // Consumer goroutine
+    go func() {
+        defer close(consumerDone)
+        for {
+            select {
+            case <-done:
+                return
+            case <-ch:
+            default:
+            }
+        }
+    }()
+
+    b.ReportAllocs()
+    b.ResetTimer()
+
+    b.RunParallel(func(pb *testing.PB) {
+        i := 0
+        for pb.Next() {
+            for {
+                select {
+                case ch <- i:
+                    goto sent
+                default:
+                }
+            }
+        sent:
+            i++
+        }
+    })
+
+    b.StopTimer()
+    close(done)
+    <-consumerDone
+}
+```
+
+**Expected results (showing channel lock contention):**
+
+| Producers | Channel Latency | vs SPSC |
+|-----------|-----------------|---------|
+| 1 (SPSC) | ~128 ns | baseline |
+| 2 | ~5.9 µs | 46x slower |
+| 4 | ~26 µs | 200x slower |
+| 8 | ~49 µs | 380x slower |
+
+> **Why this matters:** Channel lock contention scales poorly. For high-throughput MPSC, use go-lock-free-ring.
+
+#### 4.2.4 go-lock-free-ring Comparison
+
+The [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) library provides a sharded MPSC ring buffer that dramatically outperforms channels under contention.
+
+**File:** `internal/combined/lockfreering_bench_test.go`
+
+```go
+import ring "github.com/randomizedcoder/go-lock-free-ring"
+
+// BenchmarkLFR_SPSC_ShardedRing1 - go-lock-free-ring with 1 shard
+func BenchmarkLFR_SPSC_ShardedRing1(b *testing.B) {
+    r, _ := ring.NewShardedRing(1024, 1)
+    done := make(chan struct{})
+
+    go func() {
+        for {
+            select {
+            case <-done:
+                return
+            default:
+                r.TryRead()
+            }
+        }
+    }()
+
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        for !r.Write(0, i) {}
+    }
+    b.StopTimer()
+    close(done)
+}
+
+// BenchmarkLFR_MPSC_ShardedRing_8P_8S - 8 producers, 8 shards
+func BenchmarkLFR_MPSC_ShardedRing_8P_8S(b *testing.B) {
+    r, _ := ring.NewShardedRing(2048, 8)
+    done := make(chan struct{})
+    consumerDone := make(chan struct{})
+
+    go func() {
+        defer close(consumerDone)
+        for {
+            select {
+            case <-done:
+                return
+            default:
+                r.TryRead()
+            }
+        }
+    }()
+
+    var producerID atomic.Uint64
+    b.SetParallelism(8)
+    b.ResetTimer()
+
+    b.RunParallel(func(pb *testing.PB) {
+        pid := producerID.Add(1) - 1
+        i := 0
+        for pb.Next() {
+            for !r.Write(pid, i) {}
+            i++
+        }
+    })
+
+    b.StopTimer()
+    close(done)
+    <-consumerDone
+}
+```
+
+**Comparison Results:**
+
+##### SPSC (1 Producer → 1 Consumer)
+
+| Implementation | Latency | Allocs | Speedup |
+|----------------|---------|--------|---------|
+| Channel | 248 ns | 0 | baseline |
+| go-lock-free-ring (1 shard) | 114 ns | 1 | 2.2x |
+| **Our SPSC Ring (unguarded)** | **36.5 ns** | **0** | **6.8x** |
+
+> For pure SPSC, our simple ring buffer wins due to minimal overhead and zero allocations.
+
+##### MPSC (N Producers → 1 Consumer)
+
+| Producers | Channel | go-lock-free-ring | Speedup |
+|-----------|---------|-------------------|---------|
+| 4 | 35.3 µs | 539 ns | **65x** |
+| 8 | 47.1 µs | 464 ns | **101x** |
+
+> The sharded design of go-lock-free-ring eliminates lock contention, providing **65-100x** speedup.
+
+##### Choosing the Right Queue
+
+| Pattern | Best Choice | Why |
+|---------|-------------|-----|
+| 1 producer, 1 consumer | Our SPSC Ring | Fastest, zero allocs |
+| N producers, 1 consumer | go-lock-free-ring | Sharding eliminates contention |
+| Simple/infrequent | Channel | Simplicity matters more |
 
 ### 4.3 `internal/tick/tick_bench_test.go`
 
@@ -1392,79 +1613,30 @@ func BenchmarkCombined_CancelTick_Optimized(b *testing.B) {
 
 > **Why this matters:** Isolated benchmarks often show 10-20x speedups, but real loops have multiple operations. The combined benchmark shows the *actual* end-to-end improvement you'll see in production.
 
-### 4.5 Two-Goroutine SPSC Pipeline Benchmark
+### 4.5 Queue Benchmark Summary
 
-The **most representative** benchmark for real Go systems—a producer/consumer pipeline:
+> **Note:** The 2-goroutine SPSC pipeline and MPSC benchmarks are now documented in section 4.2.2 and 4.2.3 respectively, as part of the comprehensive queue benchmark suite.
 
-```go
-// internal/combined/pipeline_bench_test.go
-package combined_test
+**Key benchmark commands:**
 
-import (
-    "testing"
+```bash
+# Single-goroutine (baseline)
+go test -bench=BenchmarkQueue -benchmem ./internal/queue
 
-    "github.com/randomizedcoder/some-go-benchmarks/internal/queue"
-)
+# 2-goroutine SPSC pipeline
+go test -bench=BenchmarkPipeline -benchmem ./internal/combined
 
-func BenchmarkPipeline_Channel(b *testing.B) {
-    q := queue.NewChannel[int](1024)
-    done := make(chan struct{})
-
-    // Consumer
-    go func() {
-        for {
-            select {
-            case <-done:
-                return
-            default:
-                q.Pop()
-            }
-        }
-    }()
-
-    b.ReportAllocs()
-    b.ResetTimer()
-
-    for i := 0; i < b.N; i++ {
-        for !q.Push(i) {
-            // Spin until push succeeds
-        }
-    }
-
-    b.StopTimer()
-    close(done)
-}
-
-func BenchmarkPipeline_RingBuffer(b *testing.B) {
-    q := queue.NewRingBuffer[int](1024)
-    done := make(chan struct{})
-
-    // Consumer (single goroutine - SPSC contract)
-    go func() {
-        for {
-            select {
-            case <-done:
-                return
-            default:
-                q.Pop()
-            }
-        }
-    }()
-
-    b.ReportAllocs()
-    b.ResetTimer()
-
-    // Producer (single goroutine - SPSC contract)
-    for i := 0; i < b.N; i++ {
-        for !q.Push(i) {
-            // Spin until push succeeds
-        }
-    }
-
-    b.StopTimer()
-    close(done)
-}
+# MPSC (multiple producers)
+go test -bench=BenchmarkMPSC -benchmem ./internal/combined
 ```
+
+**What these benchmarks reveal:**
+
+| Pattern | Best Use Case |
+|---------|---------------|
+| Single goroutine | Testing raw queue overhead |
+| SPSC (2 goroutines) | Classic producer/consumer pipelines |
+| MPSC (N producers) | Fan-in patterns, worker pools |
 
 ### 4.6 Benchmark Methodology Validation
 

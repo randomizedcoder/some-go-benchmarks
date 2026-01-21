@@ -16,7 +16,27 @@ Measured on AMD Ryzen Threadripper PRO 3945WX, Go 1.25, Linux:
 |-----------|----------|-----------|---------|
 | Cancel check | 8.2 ns | 0.36 ns | **23x** |
 | Tick check | 86 ns | 5.6 ns | **15x** |
-| Queue push+pop | 37 ns | 36 ns | ~1x |
+
+### Queue Patterns: SPSC vs MPSC
+
+Queue performance depends heavily on your goroutine topology:
+
+**SPSC (1 Producer → 1 Consumer):**
+
+| Implementation | Latency | Speedup |
+|----------------|---------|---------|
+| Channel | 248 ns | baseline |
+| [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) (1 shard) | 114 ns | 2.2x |
+| Our SPSC Ring (unguarded) | **36.5 ns** | **6.8x** |
+
+**MPSC (Multiple Producers → 1 Consumer):**
+
+| Producers | Channel | go-lock-free-ring | Speedup |
+|-----------|---------|-------------------|---------|
+| 4 | 35 µs | 539 ns | **65x** |
+| 8 | 47 µs | 464 ns | **101x** |
+
+> **Key insight:** Channels scale terribly with multiple producers due to lock contention. For MPSC patterns, [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) provides **65-100x** speedup through sharded lock-free design.
 
 ### Combined Hot-Loop Pattern
 
@@ -141,14 +161,168 @@ Measure the raw cost of individual operations:
 
 > **Why combined matters:** Isolated benchmarks can be misleading. A 10x speedup on context checking means nothing if your loop is bottlenecked on channel receives. The combined benchmarks reveal the *actual* improvement in realistic scenarios.
 
+### Queue Benchmarks: Goroutine Patterns
+
+Queue performance varies dramatically based on goroutine topology. We benchmark three implementations:
+
+| Implementation | Type | Best For |
+|----------------|------|----------|
+| Go Channel | MPSC | Simple code, moderate throughput |
+| Our SPSC Ring | SPSC | Maximum SPSC performance, zero allocs |
+| [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) | MPSC | High-throughput multi-producer scenarios |
+
+#### SPSC: 1 Producer → 1 Consumer
+
+**Cross-goroutine polling** (our benchmark - separate producer/consumer goroutines):
+
+| Implementation | Latency | Allocs | Speedup |
+|----------------|---------|--------|---------|
+| Channel | 248 ns | 0 | baseline |
+| go-lock-free-ring (1 shard) | 114 ns | 1 | 2.2x |
+| **Our SPSC Ring (unguarded)** | **36.5 ns** | **0** | **6.8x** |
+
+**Same-goroutine** (go-lock-free-ring native benchmarks):
+
+| Benchmark | Latency | Notes |
+|-----------|---------|-------|
+| `BenchmarkWrite` | 35 ns | Single write operation |
+| `BenchmarkTryRead` | 31 ns | Single read operation |
+| `BenchmarkProducerConsumer` | 31 ns | Write + periodic drain in same goroutine |
+| `BenchmarkConcurrentWrite` (8 producers) | 10.7 ns | Parallel writes, sharded |
+
+> **Note:** Cross-goroutine coordination adds ~80ns overhead. For batched same-goroutine patterns, go-lock-free-ring achieves 31 ns/op.
+
+#### MPSC: N Producers → 1 Consumer
+
+This is where [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) shines:
+
+| Producers | Channel | go-lock-free-ring | Speedup |
+|-----------|---------|-------------------|---------|
+| 4 | 35.3 µs | 539 ns | **65x** |
+| 8 | 47.1 µs | 464 ns | **101x** |
+
+> **Key insight:** Channel lock contention scales terribly. With 8 producers, go-lock-free-ring is **101x faster** due to its sharded design.
+
+#### Choosing the Right Queue
+
+| Your Pattern | Recommendation | Why |
+|--------------|----------------|-----|
+| 1 producer, 1 consumer | Our SPSC Ring | Fastest, zero allocs |
+| N producers, 1 consumer | go-lock-free-ring | Sharding eliminates contention |
+| Simple/infrequent | Channel | Simplicity, good enough |
+
+#### Why Our SPSC Ring is Faster in Cross-Goroutine Tests
+
+For SPSC scenarios with **separate producer/consumer goroutines**, our simple ring (36.5 ns) beats go-lock-free-ring (114 ns).
+
+> **Important:** go-lock-free-ring's native benchmarks show ~31 ns/op for producer-consumer, but that's in the **same goroutine**. Our 114 ns measurement is for **cross-goroutine** polling, which adds coordination overhead. Both measurements are valid for their respective patterns.
+
+Here's why our ring is faster in cross-goroutine scenarios:
+
+**1. CAS vs Simple Store**
+
+go-lock-free-ring must use Compare-And-Swap to safely handle multiple producers:
+
+```go
+// go-lock-free-ring: CAS to claim slot (expensive!)
+if !atomic.CompareAndSwapUint64(&s.writePos, pos, pos+1) {
+    continue  // Retry if another producer won
+}
+```
+
+Our SPSC ring just does a simple atomic store:
+
+```go
+// Our SPSC: simple store (fast!)
+r.head.Store(head + 1)
+```
+
+CAS is **3-10x more expensive** than a simple store because it must read, compare, and conditionally write while handling cache invalidation across cores.
+
+**2. Sequence Numbers for Race Protection**
+
+go-lock-free-ring uses per-slot sequence numbers to prevent a consumer from reading partially-written data:
+
+```go
+// go-lock-free-ring: extra atomic ops for safety
+seq := atomic.LoadUint64(&sl.seq)      // Check slot ready
+if seq != pos { return false }
+// ... write value ...
+atomic.StoreUint64(&sl.seq, pos+1)     // Signal to reader
+```
+
+Our SPSC ring skips this because we **trust** only one producer exists.
+
+**3. Boxing Allocations**
+
+```go
+// go-lock-free-ring uses 'any' → 8 B allocation per write
+sl.value = value
+
+// Our ring uses generics → zero allocations
+r.buf[head&r.mask] = v
+```
+
+**What We Give Up:**
+
+| Safety Feature | Our SPSC Ring | go-lock-free-ring |
+|----------------|---------------|-------------------|
+| Multiple producers | ❌ Undefined behavior | ✅ Safe |
+| Race protection | ❌ Trust-based | ✅ Sequence numbers |
+| Weak memory (ARM) | ⚠️ May need barriers | ✅ Proven safe |
+
+> **Bottom line:** Our SPSC ring is faster because it makes **dangerous assumptions** (single producer, x86 memory model). go-lock-free-ring is slower because it's **provably safe** for MPSC with explicit race protection. Use go-lock-free-ring for production multi-producer scenarios.
+
+#### Why Our Guarded RingBuffer is Slow
+
+The in-repo `RingBuffer` includes debug guards that add ~25ns overhead:
+
+```go
+func (r *RingBuffer[T]) Push(v T) bool {
+    if !r.pushActive.CompareAndSwap(0, 1) { // +10-15ns
+        panic("concurrent Push")
+    }
+    defer r.pushActive.Store(0)             // +10-15ns
+    // ...
+}
+```
+
+**For production**: Use the unguarded version or [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring).
+
 ## High-Performance Alternatives
 
+### Lock-Free Ring Buffers
 
-### Lock-Free Ring Buffer
+We provide two lock-free queue implementations with different safety/performance tradeoffs:
 
-In place of standard channels, we evaluate lock-free ring buffers for lower-latency communication between goroutines.
+**1. Our SPSC Ring Buffer** (`internal/queue/ringbuf.go`)
+- Single-Producer, Single-Consumer only
+- Generics-based (`[T any]`) — zero boxing allocations
+- Simple atomic Load/Store (no CAS) — maximum speed
+- Debug guards catch contract violations (disable for production)
+- ⚠️ **No race protection** — trusts caller to maintain SPSC contract
+- ⚠️ **x86 optimized** — may need memory barriers on ARM
+- **Best for:** Dedicated producer/consumer goroutine pairs where you control both ends
 
-→ [github.com/randomizedcoder/go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring)
+**2. [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring)** (external library)
+- Multi-Producer, Single-Consumer (MPSC)
+- Sharded design reduces contention across producers
+- Uses CAS + sequence numbers for **proven race-free operation**
+- Uses `any` type (causes boxing allocations)
+- Configurable retry strategies for different load patterns
+- ✅ **Production-tested** at 2300+ Mb/s throughput
+- **Best for:** Fan-in patterns, worker pools, high-throughput pipelines
+
+| Feature | Our SPSC Ring | go-lock-free-ring |
+|---------|---------------|-------------------|
+| Producers | 1 only | Multiple |
+| Consumers | 1 only | 1 only |
+| Allocations | 0 | 1+ (boxing) |
+| SPSC latency | **36.5 ns** | 114 ns |
+| 8-producer latency | N/A | **464 ns** |
+| Race protection | ❌ None | ✅ Sequence numbers |
+| Write mechanism | Store | CAS + retry |
+| Production ready | ⚠️ SPSC only | ✅ Battle-tested |
 
 ### Atomic Flags for Cancellation
 
@@ -210,27 +384,55 @@ The Go runtime has an internal function `nanotime()` that returns a monotonic cl
 func nanotime() int64
 ```
 
-## Repo layout
+## Repo Layout
 
-The project layout is:
 ```
-[das@l:~/Downloads/some-go-benchmarks]$ tree
 .
-├── cmd
-│   ├── channel
-│   ├── context
-│   ├── context-ticker
-│   └── ticker
-├── internal
-├── LICENSE
-└── README.md
-
-7 directories, 2 files
+├── cmd/                        # CLI tools for interactive benchmarking
+│   ├── channel/main.go         # Queue comparison demo
+│   ├── context/main.go         # Cancel check comparison demo
+│   ├── context-ticker/main.go  # Combined benchmark demo
+│   └── ticker/main.go          # Tick check comparison demo
+│
+├── internal/
+│   ├── cancel/                 # Cancellation signaling
+│   │   ├── cancel.go           # Canceler interface
+│   │   ├── context.go          # Standard: ctx.Done() via select
+│   │   ├── atomic.go           # Optimized: atomic.Bool
+│   │   └── *_test.go           # Unit + benchmark tests
+│   │
+│   ├── queue/                  # SPSC message passing
+│   │   ├── queue.go            # Queue[T] interface
+│   │   ├── channel.go          # Standard: buffered channel
+│   │   ├── ringbuf.go          # Optimized: lock-free ring buffer
+│   │   └── *_test.go           # Unit + benchmark + contract tests
+│   │
+│   ├── tick/                   # Periodic triggers
+│   │   ├── tick.go             # Ticker interface
+│   │   ├── ticker.go           # Standard: time.Ticker
+│   │   ├── batch.go            # Optimized: check every N ops
+│   │   ├── atomic.go           # Optimized: runtime.nanotime
+│   │   ├── tsc_amd64.go/.s     # Optimized: raw RDTSC (x86 only)
+│   │   ├── tsc_stub.go         # Stub for non-x86 architectures
+│   │   └── *_test.go           # Unit + benchmark tests
+│   │
+│   └── combined/               # Interaction benchmarks
+│       └── combined_bench_test.go
+│
+├── .github/workflows/ci.yml    # CI: multi-version, multi-platform
+├── Makefile                    # Build targets
+├── README.md                   # This file
+├── WALKTHROUGH.md              # Guided tutorial with example output
+├── BENCHMARKING.md             # Environment setup & methodology
+├── IMPLEMENTATION_PLAN.md      # Design document
+└── IMPLEMENTATION_LOG.md       # Development log
 ```
 
-The internal folder is for small library functions that holds the main code.
+**Key directories:**
 
-The ./cmd/ folder has a main.go implmentations that use the libraries, to demostrate limits.
+- `internal/` — Core library implementations (standard vs optimized)
+- `cmd/` — CLI tools that demonstrate the libraries with human-readable output
+- `.github/workflows/` — CI testing across Go 1.21-1.23, Linux/macOS
 
 ## How to Run
 
