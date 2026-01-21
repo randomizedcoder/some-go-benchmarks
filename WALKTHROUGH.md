@@ -33,6 +33,57 @@ ok      github.com/randomizedcoder/some-go-benchmarks/internal/queue    0.004s
 ok      github.com/randomizedcoder/some-go-benchmarks/internal/tick     0.735s
 ```
 
+### Using the Makefile
+
+The project includes a Makefile with convenient targets:
+
+```bash
+$ make help
+```
+
+**Output:**
+
+```
+Available targets:
+
+Build & Test:
+  build          - Build all packages
+  test           - Run all tests
+  race           - Run tests with race detector
+  lint           - Run golangci-lint
+  check          - Run build, test, and race
+
+All Benchmarks:
+  bench          - Run all benchmarks with memory stats
+  bench-count    - Run benchmarks 10 times (for variance)
+  bench-variance - Run benchmarks and save for benchstat
+  bench-race     - Run benchmarks with race detector
+
+Category Benchmarks:
+  bench-cancel   - Cancel check: context vs atomic
+  bench-tick     - Tick check: ticker implementations
+  bench-queue    - Queue: single goroutine push+pop
+  bench-pipeline - Pipeline: 2-goroutine SPSC producer/consumer
+  bench-mpsc     - MPSC: N producers -> 1 consumer (channel contention)
+  bench-lfr      - go-lock-free-ring comparison (SPSC vs MPSC)
+  bench-combined - Combined loop: cancel + tick + queue
+
+Cleanup:
+  clean          - Remove generated files
+```
+
+**Quick Start:**
+
+```bash
+# Run all benchmarks
+$ make bench
+
+# Run specific category
+$ make bench-lfr      # go-lock-free-ring comparison
+$ make bench-mpsc     # Channel contention with multiple producers
+$ make bench-pipeline # 2-goroutine producer/consumer
+```
+
 ---
 
 ## Step 2: Run Basic Benchmarks
@@ -117,6 +168,146 @@ BenchmarkCombined_FullLoop_Optimized-24         19513278                62.86 ns
 ```
 
 **Key insight:** Combined optimizations give **2.1x speedup** on the full loop (130 ns → 63 ns)
+
+---
+
+### Queue Benchmarks: Goroutine Patterns
+
+Queue performance varies dramatically based on goroutine topology.
+
+#### Single Goroutine (No Contention)
+
+```bash
+$ go test -bench=BenchmarkQueue -benchmem ./internal/queue
+```
+
+**Output:**
+
+```
+goos: linux
+goarch: amd64
+pkg: github.com/randomizedcoder/some-go-benchmarks/internal/queue
+cpu: AMD Ryzen Threadripper PRO 3945WX 12-Cores
+BenchmarkQueue_Channel_PushPop_Direct-24           30932498                38.96 ns/op            0 B/op          0 allocs/op
+BenchmarkQueue_RingBuffer_PushPop_Direct-24        32920832                35.89 ns/op            0 B/op          0 allocs/op
+BenchmarkQueue_Channel_PushPop_Interface-24        27947314                43.26 ns/op            0 B/op          0 allocs/op
+BenchmarkQueue_RingBuffer_PushPop_Interface-24     30313048                40.37 ns/op            0 B/op          0 allocs/op
+```
+
+> **Note:** The in-repo RingBuffer has SPSC guards that add overhead. An unguarded ring buffer achieves ~9.5 ns/op.
+
+#### SPSC: 1 Producer → 1 Consumer (2 Goroutines)
+
+This is the classic producer/consumer pattern—the most common Go concurrency pattern:
+
+```bash
+$ go test -bench=BenchmarkPipeline -benchmem ./internal/combined
+```
+
+**Output:**
+
+```
+goos: linux
+goarch: amd64
+pkg: github.com/randomizedcoder/some-go-benchmarks/internal/combined
+cpu: AMD Ryzen Threadripper PRO 3945WX 12-Cores
+BenchmarkPipeline_Channel-24             7858700               127.9 ns/op            0 B/op           0 allocs/op
+BenchmarkPipeline_RingBuffer-24         11740012               146.8 ns/op            0 B/op           0 allocs/op
+```
+
+> **Key insight:** The guarded RingBuffer is *slower* than channels due to SPSC guard overhead. An unguarded lock-free ring buffer achieves ~39 ns/op (**3.3x faster** than channels).
+
+#### MPSC: N Producers → 1 Consumer (Channel Lock Contention)
+
+Multiple goroutines sending to one consumer shows channel lock contention:
+
+```bash
+$ go test -bench=BenchmarkMPSC -benchmem ./internal/combined
+```
+
+**Output:**
+
+```
+goos: linux
+goarch: amd64
+pkg: github.com/randomizedcoder/some-go-benchmarks/internal/combined
+cpu: AMD Ryzen Threadripper PRO 3945WX 12-Cores
+BenchmarkMPSC_Channel_2Producers-24       180842              5922 ns/op              0 B/op           0 allocs/op
+BenchmarkMPSC_Channel_4Producers-24       119090             26351 ns/op              0 B/op           0 allocs/op
+BenchmarkMPSC_Channel_8Producers-24       171520             49074 ns/op              0 B/op           0 allocs/op
+```
+
+**Lock contention scaling:**
+
+| Producers | Latency | vs 1 Producer |
+|-----------|---------|---------------|
+| 1 (SPSC) | 128 ns | baseline |
+| 2 | 5.9 µs | **46x** slower |
+| 4 | 26 µs | **200x** slower |
+| 8 | 49 µs | **380x** slower |
+
+> **Key insight:** Channel lock contention scales poorly. For high-throughput fan-in patterns, use go-lock-free-ring.
+
+#### go-lock-free-ring Comparison
+
+The [go-lock-free-ring](https://github.com/randomizedcoder/go-lock-free-ring) library provides a sharded MPSC ring buffer. Let's compare:
+
+```bash
+$ go test -bench=BenchmarkLFR -benchmem ./internal/combined
+```
+
+**Output:**
+
+```
+goos: linux
+goarch: amd64
+pkg: github.com/randomizedcoder/some-go-benchmarks/internal/combined
+cpu: AMD Ryzen Threadripper PRO 3945WX 12-Cores
+BenchmarkLFR_SPSC_Channel-24                     4372419               247.8 ns/op             0 B/op          0 allocs/op
+BenchmarkLFR_SPSC_OurRing-24                    33405556                36.53 ns/op            0 B/op          0 allocs/op
+BenchmarkLFR_SPSC_ShardedRing1-24               10212240               114.1 ns/op             8 B/op          1 allocs/op
+BenchmarkLFR_MPSC_Channel_4P-24                    85386             35337 ns/op               0 B/op          0 allocs/op
+BenchmarkLFR_MPSC_ShardedRing_4P_4S-24           2179492               539.4 ns/op           412 B/op         51 allocs/op
+BenchmarkLFR_MPSC_Channel_8P-24                    58347             47067 ns/op               1 B/op          0 allocs/op
+BenchmarkLFR_MPSC_ShardedRing_8P_8S-24           2596642               464.0 ns/op           412 B/op         51 allocs/op
+```
+
+**SPSC Comparison (1 Producer → 1 Consumer):**
+
+These are **cross-goroutine** benchmarks (separate producer/consumer goroutines):
+
+| Implementation | Latency | Allocs | Speedup |
+|----------------|---------|--------|---------|
+| Channel | 248 ns | 0 | baseline |
+| go-lock-free-ring (1 shard) | 114 ns | 1 | 2.2x |
+| **Our SPSC Ring** | **36.5 ns** | **0** | **6.8x** |
+
+> **Note:** go-lock-free-ring's native `BenchmarkProducerConsumer` shows 31 ns/op, but that's in the **same goroutine**. Cross-goroutine polling adds ~80ns coordination overhead.
+
+**Why Our SPSC Ring is Faster in Cross-Goroutine Tests:**
+
+1. **CAS vs Store**: go-lock-free-ring uses `CompareAndSwap` to safely handle multiple producers (3-10x slower than simple Store)
+2. **Sequence numbers**: go-lock-free-ring uses per-slot sequence numbers to prevent race conditions (extra atomic ops)
+3. **Boxing**: go-lock-free-ring uses `any` type causing allocations; our ring uses generics (zero allocs)
+
+> **Tradeoff**: Our ring is faster because it makes dangerous assumptions (single producer, x86 memory model). go-lock-free-ring is slower because it's provably race-free.
+
+**MPSC Comparison (N Producers → 1 Consumer):**
+
+| Producers | Channel | go-lock-free-ring | Speedup |
+|-----------|---------|-------------------|---------|
+| 4 | 35.3 µs | 539 ns | **65x** |
+| 8 | 47.1 µs | 464 ns | **101x** |
+
+> **Key insight:** go-lock-free-ring's sharded design eliminates lock contention, providing **65-101x** speedup over channels for multi-producer scenarios!
+
+**Choosing the Right Queue:**
+
+| Your Pattern | Best Choice | Why |
+|--------------|-------------|-----|
+| 1 producer, 1 consumer | Our SPSC Ring | Fastest (36.5 ns), zero allocs |
+| N producers, 1 consumer | go-lock-free-ring | Sharding eliminates contention |
+| Simple/infrequent | Channel | Simplicity over speed |
 
 ---
 
@@ -275,6 +466,8 @@ $ sudo nice -n -20 taskset -c 0 GOMAXPROCS=1 go test -bench=. ./internal/cancel
 |-----------|----------|-----------|---------|
 | Cancel check | 8.2 ns | 0.36 ns | **23x** |
 | Tick check | 86 ns | 5.6 ns (batch) | **15x** |
+| Queue SPSC (2 goroutines) | 248 ns | 36.5 ns | **6.8x** |
+| Queue MPSC (8 producers) | 47 µs | 464 ns | **101x** |
 | Combined loop | 130 ns | 63 ns | **2.1x** |
 
 ### When Do These Optimizations Matter?

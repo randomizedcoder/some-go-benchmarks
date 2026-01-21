@@ -177,3 +177,155 @@ func BenchmarkPipeline_RingBuffer(b *testing.B) {
 	b.StopTimer()
 	close(done)
 }
+
+// ============================================================================
+// MPSC benchmarks (Multiple Producer, Single Consumer)
+// ============================================================================
+// This is a very common Go pattern: multiple goroutines sending to one consumer.
+// Channels naturally support this. Lock-free MPSC queues are more complex
+// and require different data structures than SPSC.
+
+// BenchmarkMPSC_Channel_2Producers benchmarks 2 producers -> 1 consumer.
+func BenchmarkMPSC_Channel_2Producers(b *testing.B) {
+	ch := make(chan int, 1024)
+	done := make(chan struct{})
+	var consumerDone chan struct{}
+
+	// Consumer goroutine
+	consumerDone = make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ch:
+				// consume
+			default:
+				// non-blocking
+			}
+		}
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	// Run producers in parallel using b.RunParallel
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			select {
+			case ch <- i:
+			default:
+				// Channel full, spin
+				for {
+					select {
+					case ch <- i:
+						goto sent
+					default:
+					}
+				}
+			sent:
+			}
+			i++
+		}
+	})
+
+	b.StopTimer()
+	close(done)
+	<-consumerDone
+}
+
+// BenchmarkMPSC_Channel_4Producers benchmarks 4 producers -> 1 consumer.
+func BenchmarkMPSC_Channel_4Producers(b *testing.B) {
+	ch := make(chan int, 1024)
+	done := make(chan struct{})
+	var consumerDone chan struct{}
+
+	// Consumer goroutine
+	consumerDone = make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ch:
+				// consume
+			default:
+				// non-blocking
+			}
+		}
+	}()
+
+	// Set GOMAXPROCS for consistent producer count
+	b.SetParallelism(4)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			for {
+				select {
+				case ch <- i:
+					goto sent
+				default:
+				}
+			}
+		sent:
+			i++
+		}
+	})
+
+	b.StopTimer()
+	close(done)
+	<-consumerDone
+}
+
+// BenchmarkMPSC_Channel_8Producers benchmarks 8 producers -> 1 consumer.
+// This stresses channel lock contention heavily.
+func BenchmarkMPSC_Channel_8Producers(b *testing.B) {
+	ch := make(chan int, 1024)
+	done := make(chan struct{})
+	var consumerDone chan struct{}
+
+	// Consumer goroutine
+	consumerDone = make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		for {
+			select {
+			case <-done:
+				return
+			case <-ch:
+				// consume
+			default:
+				// non-blocking
+			}
+		}
+	}()
+
+	b.SetParallelism(8)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			for {
+				select {
+				case ch <- i:
+					goto sent
+				default:
+				}
+			}
+		sent:
+			i++
+		}
+	})
+
+	b.StopTimer()
+	close(done)
+	<-consumerDone
+}
