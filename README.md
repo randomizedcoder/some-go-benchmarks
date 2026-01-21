@@ -4,6 +4,47 @@ Micro-benchmarks for Go concurrency patterns in **polling hot-loops**.
 
 > ⚠️ **Scope:** These benchmarks apply to polling patterns (with `default:` case) where you check channels millions of times per second. Most Go code uses blocking patterns instead—see [Polling vs Blocking](#polling-vs-blocking-when-do-these-benchmarks-apply) before drawing conclusions.
 
+📖 **New to this repo?** Start with the [Walkthrough](WALKTHROUGH.md) for a guided tour with example outputs.
+
+## Results at a Glance
+
+Measured on AMD Ryzen Threadripper PRO 3945WX, Go 1.25, Linux:
+
+### Isolated Operations
+
+| Operation | Standard | Optimized | Speedup |
+|-----------|----------|-----------|---------|
+| Cancel check | 8.2 ns | 0.36 ns | **23x** |
+| Tick check | 86 ns | 5.6 ns | **15x** |
+| Queue push+pop | 37 ns | 36 ns | ~1x |
+
+### Combined Hot-Loop Pattern
+
+```go
+for {
+    if ctx.Done() { return }      // ← Cancel check
+    if ticker.Tick() { flush() }  // ← Tick check
+    process(queue.Pop())          // ← Queue op
+}
+```
+
+| Pattern | Standard | Optimized | Speedup |
+|---------|----------|-----------|---------|
+| Cancel + Tick | 90 ns | 27 ns | **3.4x** |
+| Full loop | 130 ns | 63 ns | **2.1x** |
+
+### Real-World Impact
+
+| Throughput | Standard CPU | Optimized CPU | You Save |
+|------------|--------------|---------------|----------|
+| 100K ops/sec | 1.3% | 0.6% | 0.7% of a core |
+| 1M ops/sec | 13% | 6% | **7% of a core** |
+| 10M ops/sec | 130% | 63% | **67% of a core** |
+
+> **TL;DR:** At 10M ops/sec, switching to optimized patterns frees up 2/3 of a CPU core.
+
+---
+
 ## The Problem
 
 At the scale of millions of operations per second, idiomatic Go constructs like select on time.Ticker or standard channels introduce significant overhead. These bottlenecks stem from:
